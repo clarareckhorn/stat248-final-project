@@ -1,0 +1,639 @@
+---
+title: "Final Project"
+subtitle: "STAT 248"
+author: "Clara Reckhorn"
+format: html
+---
+
+# The Question
+
+Is there some sort of seasonality in the types of crimes over 10 years in Berkeley? Does the mix of crime types shift with the seasons?
+
+# Loading the data
+
+The dataset I will use is the Berkeley Police Department’s Cases from 2016 to current, in which each row is a police-reported case, and the columns are that case’s ID number, the time and date at which it occurred, the incident type, statute, statute description, block address, city, and ZIP code.
+
+```{python}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import periodogram, welch
+```
+
+```{python}
+bpd = pd.read_csv("data/bpd-2016-now.csv")
+bpd.head()
+```
+
+# Cleaning the Data
+
+After printing the first rows of data, I can see that I am interested mostly in the `Case_Number`, `Occurred_Datetime`, and `Incident_Type` columns. These columns are the only ones that are relevant for my analysis.
+
+```{python}
+bpd = bpd[["Case_Number", "Occurred_Datetime", "Incident_Type"]]
+bpd.head()
+```
+
+```{python}
+# parse date time column
+bpd["Occurred_Datetime"] = pd.to_datetime(bpd["Occurred_Datetime"])
+bpd["Month"] = bpd["Occurred_Datetime"].dt.month
+bpd["Year"] = bpd["Occurred_Datetime"].dt.year
+
+# add season column
+def get_season(month):
+    if month in [12, 1, 2]:
+        return "Winter"
+    elif month in [3, 4, 5]:
+        return "Spring"
+    elif month in [6, 7, 8]:
+        return "Summer"
+    else:
+        return "Fall"
+
+bpd["Season"] = bpd["Month"].apply(get_season)
+bpd.head()
+```
+
+In `Incident_Type`, there are the following 40 entries:
+
+```{python}
+print(bpd["Incident_Type"].unique())
+print(bpd["Incident_Type"].nunique())
+```
+
+The primary ones I originally wanted to focus on in terms of identifying seasonality are: Robbery, Assault/Battery Felony, Vehicle Stolen, Burglary Residential, Homicide, Driving under the influence, Alcohol Related Offense, Child Abuse, and Gun/Weapon. I believed these would be the most revealing in terms of seasonality.
+
+However, after looking at my data, I can see a lot of those categories don't have a lot of observations, so instead I will focus on the categories with the most data. Those are:
+
+| Category                        | Number of Observations |
+|---------------------------------|------------------------|
+| Theft Misdemeanor (Under \$950) | 17156                  |
+| Burglary Auto                   | 14585                  |
+| Vehicle Stolen                  | 8207                   |
+| Disturbance                     | 8166                   |
+| Theft Felony (over \$950)       | 6685                   |
+| Vandalism                       | 6535                   |
+| Burglary Residential            | 5468                   |
+| Assault/Battery Misdemeanor     | 4918                   |
+
+```{python}
+# Prep to aggregate to weekly counts per crime type
+bpd["Week"] = bpd["Occurred_Datetime"].dt.to_period("W")
+bpd.head()
+
+# focus on the major categories
+major_crimes = ["Theft Misdemeanor (Under $950)", "Burglary Auto", "Vehicle Stolen", "Disturbance", "Theft Felony (over $950)", "Vandalism", "Burglary Residential", "Assault/Battery Misdemeanor"]
+
+```
+
+```{python}
+# Remove duplicates introduced by dropping the specific Statute_Description column
+bpd_clean = bpd.drop_duplicates(subset="Case_Number")
+bpd_clean.head()
+
+counts = bpd_clean["Incident_Type"].value_counts()
+print(counts.to_string())
+
+# Filtering to rows matching major categories
+bpd_filtered = bpd_clean[bpd_clean["Incident_Type"].isin(major_crimes)]
+bpd.head()
+```
+
+
+
+Next I will continue preparing the data to week.
+
+```{python}
+# Weekly counts per crime type
+weekly = (
+    bpd_filtered
+    .groupby(["Week", "Incident_Type"])
+    .size()
+    .reset_index(name="Count")
+    .pivot(index="Week", columns="Incident_Type", values="Count")
+    .fillna(0)
+    .sort_index()
+)
+
+weekly.head()
+```
+
+## Data Visualization
+
+```{python}
+fig, axes = plt.subplots(4, 2, figsize=(16, 20))
+axes = axes.flatten()
+
+for i, crime in enumerate(major_crimes):
+    # aggregate to monthly counts
+    monthly = (
+        bpd_filtered[bpd_filtered["Incident_Type"] == crime]
+        .groupby(["Year", "Month"])
+        .size()
+        .reset_index(name="Count")
+    )
+    monthly["Date"] = pd.to_datetime(monthly[["Year", "Month"]].assign(day=1))
+    
+    axes[i].bar(monthly["Date"], monthly["Count"], width=25, color="steelblue", alpha=0.7)
+    axes[i].set_title(crime, fontsize=12, fontweight="bold")
+    axes[i].set_xlabel("Date")
+    axes[i].set_ylabel("Count")
+    axes[i].tick_params(axis="x", rotation=45)
+
+plt.suptitle("Monthly Crime Counts by Type (2016 to Present)", fontsize=16, fontweight="bold", y=1.01)
+plt.tight_layout()
+plt.show()
+```
+
+# Power Spectral Analysis
+
+I will conduct Power Spectral Density using Welch's method. Welch smooths the raw periodigram by averaging the overlapping segments, which reduces noise so peaks are easier to interpret when they occur.
+
+```{python power spectral analysis}
+fs = 1  # 1 sample per week
+freq_labels = {1/52: "Annual", 1/26: "Semi-annual", 1/13: "Quarterly", 1/4: "Monthly"}
+
+fig, axes = plt.subplots(len(weekly.columns), 1, figsize=(10, 3 * len(weekly.columns)), sharex=True)
+
+for ax, crime in zip(axes, weekly.columns):
+    signal = weekly[crime].values
+    freqs, psd = welch(signal, fs=fs, nperseg=52)  # nperseg=52 = 1yr window
+
+    ax.semilogy(freqs, psd, color="steelblue", linewidth=1.5)
+    ax.set_title(crime, fontsize=11, fontweight="bold")
+    ax.set_ylabel("Power")
+
+    # Marking known seasonal frequencies
+    for freq, label in freq_labels.items():
+        ax.axvline(x=freq, color="red", linestyle="--", alpha=0.5, linewidth=1)
+        ax.text(freq, ax.get_ylim()[1], label, rotation=90, fontsize=7,
+                color="red", va="top", ha="right")
+
+
+axes[-1].set_xlabel("Frequency (cycles per week)")
+fig.suptitle("Welch Power Spectral Density by Crime Type", fontsize=13, fontweight="bold", y=1.01)
+plt.tight_layout()
+plt.show()
+```
+
+The results of these power spectral analysis charts are quite clear in terms of identifying where there exists periodicity in the various crime categories:
+
+- Theft Misdemeanor (Under $950)
+
+- Burglary Auto
+
+- Vehicle Stolen
+
+- Disturbance
+
+- Theft Felony (over $950)
+
+- Vandalism
+
+- Burglary Residential
+
+- Assault/Battery Misdemeanor
+
+
+# Short-time Fourier Transform
+
+Next, I will identify if the seasonal structure has shifted over the decade. This could be especially interesting after 2020.
+
+```{python}
+from scipy.signal import stft
+import matplotlib.colors as mcolors
+
+ncols = 3
+nrows = math.ceil(len(major_crimes) / ncols)
+
+fig, axes = plt.subplots(nrows, ncols, figsize=(18, 4 * nrows))
+axes = axes.flatten()
+
+# Get the start year for x-axis labels
+start_year = weekly.index[0].start_time.year
+
+for i, crime in enumerate(major_crimes):
+    signal = weekly[crime].values
+    
+    # STFT: nperseg=52 = 1-year window, noverlap=26 = 50% overlap
+    freqs, times, Zxx = stft(signal, fs=1, nperseg=52, noverlap=26)
+    
+    # Plot only frequencies up to semi-annual (1/26) for readability
+    freq_mask = freqs <= 1/13
+    
+    im = axes[i].pcolormesh(
+        times, freqs[freq_mask], np.abs(Zxx[freq_mask]),
+        shading="gouraud", cmap="inferno"
+    )
+    
+    # Mark annual and semi-annual lines
+    for freq, label in [(1/52, "Annual"), (1/26, "Semi-annual")]:
+        axes[i].axhline(y=freq, color="cyan", linestyle="--", linewidth=1, alpha=0.7)
+        axes[i].text(times[-1], freq, label, fontsize=7, color="cyan", va="bottom", ha="right")
+    
+    # X-axis: convert week indices to years
+    n_weeks = len(signal)
+    tick_positions = np.linspace(0, n_weeks, 6)
+    tick_labels = [str(int(start_year + t / 52)) for t in tick_positions]
+    axes[i].set_xticks(tick_positions)
+    axes[i].set_xticklabels(tick_labels, fontsize=8)
+    
+    axes[i].set_title(crime, fontsize=10, fontweight="bold")
+    axes[i].set_ylabel("Frequency", fontsize=8)
+    axes[i].set_xlabel("Year", fontsize=8)
+    fig.colorbar(im, ax=axes[i], label="|STFT|")
+
+# Hide unused plot
+for j in range(i + 1, len(axes)):
+    axes[j].set_visible(False)
+
+fig.suptitle("Short-Time Fourier Transform by Crime Type", 
+             fontsize=14, fontweight="bold")
+plt.tight_layout()
+plt.show()
+```
+
+These plots indicate that Berkeley has become safer with time, which is a surprising result. Below are the trends by category:
+
+Strong annual periodicity:
+
+- Burglary Residential: bright, consistent band right at the annual line, persisting until 2023.
+
+- Vehicle Stolen: clear annual signal, especially 2019-2025, which brightens after the pandemic.
+
+- Theft Misdemeanor: bright annual signal, consistent throughout.
+
+Strong semi-annual periodicity:
+
+- Burglary Auto: has some flares that are bright in the semi-annual band, but mostly bright in the annual area. Very bright 2016-2019, with a marked decrease during COVID years, and a smaller resurgence in 2021-2023. 
+
+- Theft Felony: shows some annual periodicity but its not as consistent of a horizontal band like for Theft Misdimeanor. Much brighter after the pandemic years. 
+
+Mixed/diffuse signals:
+
+- Disturbance: energy is spread across low frequencies rather than concentrated at annual or semi-annual, suggesting slow trends rather than sharp seasonal cycles.
+
+- Vandalism: similar to disturbance, diffused low-frequency energy. Some trends annually. 
+
+- Assault/Battery Misdemeanor: relatively dim overall but some annual structure visible.
+
+# Time Lagged Regression
+
+Building weekly counts per crime type:
+
+```{python}
+# Convert Period index to timestamp for TLR compatibility
+weekly_tlr = weekly.copy()
+```
+
+For every crime type, creating the lagged variables and running the regression:
+
+### Residential Burglaries
+
+```{python}
+import statsmodels.api as sm
+
+crime = 'Burglary Residential'
+
+df = pd.DataFrame()
+df['y'] = weekly_tlr[crime]
+df['lag52'] = weekly_tlr[crime].shift(52)
+df['lag51'] = weekly_tlr[crime].shift(51)
+df['lag53'] = weekly_tlr[crime].shift(53)
+df = df.dropna()
+
+X = sm.add_constant(df[['lag52', 'lag51', 'lag53']])
+y = df['y']
+
+model = sm.NegativeBinomial(y, X).fit()
+print(model.summary())
+```
+
+Results: lag52 and lag51 are both statistically significant, meaning knowing how many residential burglaries happened exactly one year ago meaningfully predicts this week's count. 
+
+LLR p = 0.0006 so the model as a whole is significant. 
+
+Alpha = 0.0803 so overdispersion is quite low, residential burglary counts are relatively well-behaved and consistent week to week compared to rarer crimes
+
+### Vehicle Stolen
+
+```{python}
+crime = 'Vehicle Stolen'
+
+df = pd.DataFrame()
+df['y'] = weekly_tlr[crime]
+df['lag52'] = weekly_tlr[crime].shift(52)
+df['lag51'] = weekly_tlr[crime].shift(51)
+df['lag53'] = weekly_tlr[crime].shift(53)
+df = df.dropna()
+
+X = sm.add_constant(df[['lag52', 'lag51', 'lag53']])
+y = df['y']
+
+model = sm.NegativeBinomial(y, X).fit()
+print(model.summary())
+```
+
+Results: lag51 is significant, but lag52 and lag53 are not. Indicates that seasonality exists but doesn't repeat on a precise week-for-week basis. 
+
+LLR p = 5.1e-08 indicates that the model is highly significant.
+
+For vehicle theft specifically, this makes sense: the seasonal peak is likely to shift with weather and opportunity rather than falling on a specific calendar week each year.
+
+### Theft Misdimeanor
+
+```{python}
+crime = 'Theft Misdemeanor (Under $950)'
+
+df = pd.DataFrame()
+df['y'] = weekly_tlr[crime]
+df['lag52'] = weekly_tlr[crime].shift(52)
+df['lag51'] = weekly_tlr[crime].shift(51)
+df['lag53'] = weekly_tlr[crime].shift(53)
+df = df.dropna()
+
+X = sm.add_constant(df[['lag52', 'lag51', 'lag53']])
+y = df['y']
+
+model = sm.NegativeBinomial(y, X).fit()
+print(model.summary())
+```
+
+Results: lag52 and lag51 are not siginifcant, but lag53 is. This could mean that the seasonal pattern takes just over a year to repeat, or the peak drifts later in the calendar each year. 
+
+LLR p = 0.0008 so likely the model is significant despite the fact that individual lag pattern is asymmetric.
+
+Alpha = 0.0182 so overdispersion is low and weekly counts are relatively stable
+
+### Burglary Auto
+
+```{python}
+crime = 'Burglary Auto'
+
+df = pd.DataFrame()
+df['y'] = weekly_tlr[crime]
+df['lag52'] = weekly_tlr[crime].shift(52)
+df['lag51'] = weekly_tlr[crime].shift(51)
+df['lag53'] = weekly_tlr[crime].shift(53)
+df = df.dropna()
+
+X = sm.add_constant(df[['lag52', 'lag51', 'lag53']])
+y = df['y']
+
+model = sm.NegativeBinomial(y, X).fit()
+print(model.summary())
+```
+
+Results: no signficant p values and the LLR p-value indicates the model is not significant. This makes sense because, in the STFT, burglary auto was shown to have more semi-annual trends, and not as much annual trends. 
+
+I will do another regression at lag26 to possibly identify semi-annual trends:
+
+```{python}
+crime = 'Burglary Auto'
+
+df = pd.DataFrame()
+df['y'] = weekly_tlr[crime]
+df['lag26'] = weekly_tlr[crime].shift(26)
+df['lag25'] = weekly_tlr[crime].shift(25)
+df['lag27'] = weekly_tlr[crime].shift(27)
+df = df.dropna()
+
+X = sm.add_constant(df[['lag26', 'lag25', 'lag27']])
+y = df['y']
+
+model = sm.NegativeBinomial(y, X).fit()
+print(model.summary())
+```
+
+After this, I can see that each lag around the six-month mark is significant, and the coefficients are all similar (0.0056, 0.0073, 0.0063). Auto burglary likely has a semi-annual trend structure.
+
+### Theft Felony
+
+```{python}
+crime = 'Theft Felony (over $950)'
+
+df = pd.DataFrame()
+df['y'] = weekly_tlr[crime]
+df['lag52'] = weekly_tlr[crime].shift(52)
+df['lag51'] = weekly_tlr[crime].shift(51)
+df['lag53'] = weekly_tlr[crime].shift(53)
+df = df.dropna()
+
+X = sm.add_constant(df[['lag52', 'lag51', 'lag53']])
+y = df['y']
+
+model = sm.NegativeBinomial(y, X).fit()
+print(model.summary())
+```
+
+Also computing for semi-annual:
+
+```{python}
+crime = 'Theft Felony (over $950)'
+
+df = pd.DataFrame()
+df['y'] = weekly_tlr[crime]
+df['lag26'] = weekly_tlr[crime].shift(26)
+df['lag25'] = weekly_tlr[crime].shift(25)
+df['lag27'] = weekly_tlr[crime].shift(27)
+df = df.dropna()
+
+X = sm.add_constant(df[['lag26', 'lag25', 'lag27']])
+y = df['y']
+
+model = sm.NegativeBinomial(y, X).fit()
+print(model.summary())
+```
+
+Results: it seems clear that the annual lag52 is weak and inconclusive (lag52 p = 0.096, lag51 p = 0.791, lag53 p = 0.072) although the model is significant (LLR p = 0.0019). However, at the semi-annual level, two p values are significant (lag26 p = 0.001, lag25 p = 0.022, lag27 p = 0.107). Its dominant seasonal structure is semi-annual, not annual.
+
+### Disturbance
+
+```{python}
+crime = 'Disturbance'
+
+df = pd.DataFrame()
+df['y'] = weekly_tlr[crime]
+df['lag52'] = weekly_tlr[crime].shift(52)
+df['lag51'] = weekly_tlr[crime].shift(51)
+df['lag53'] = weekly_tlr[crime].shift(53)
+df = df.dropna()
+
+X = sm.add_constant(df[['lag52', 'lag51', 'lag53']])
+y = df['y']
+
+model = sm.NegativeBinomial(y, X).fit()
+print(model.summary())
+```
+
+Also doing semi-annual:
+
+```{python}
+crime = 'Disturbance'
+
+df = pd.DataFrame()
+df['y'] = weekly_tlr[crime]
+df['lag26'] = weekly_tlr[crime].shift(26)
+df['lag25'] = weekly_tlr[crime].shift(25)
+df['lag27'] = weekly_tlr[crime].shift(27)
+df = df.dropna()
+
+X = sm.add_constant(df[['lag26', 'lag25', 'lag27']])
+y = df['y']
+
+model = sm.NegativeBinomial(y, X).fit()
+print(model.summary())
+```
+
+Results: seems like disturbance, just like felony theft and auto burglary, has more of a semi-annual periodicity than annual. All semi-annual lags are significant (lag26 p = 0.015, lag25 p = 0.000, lag27 p = 0.049)
+
+### Vandalism
+
+```{python}
+crime = 'Vandalism'
+
+df = pd.DataFrame()
+df['y'] = weekly_tlr[crime]
+df['lag52'] = weekly_tlr[crime].shift(52)
+df['lag51'] = weekly_tlr[crime].shift(51)
+df['lag53'] = weekly_tlr[crime].shift(53)
+df = df.dropna()
+
+X = sm.add_constant(df[['lag52', 'lag51', 'lag53']])
+y = df['y']
+
+model = sm.NegativeBinomial(y, X).fit()
+print(model.summary())
+```
+
+Also doing semi-annual:
+
+```{python}
+crime = 'Vandalism'
+
+df = pd.DataFrame()
+df['y'] = weekly_tlr[crime]
+df['lag26'] = weekly_tlr[crime].shift(26)
+df['lag25'] = weekly_tlr[crime].shift(25)
+df['lag27'] = weekly_tlr[crime].shift(27)
+df = df.dropna()
+
+X = sm.add_constant(df[['lag26', 'lag25', 'lag27']])
+y = df['y']
+
+model = sm.NegativeBinomial(y, X).fit()
+print(model.summary())
+```
+
+Results: also has more of a semi-annual periodicity than annual. All semi-annual lags are significant (lag26 p = 0.002, lag25 p = 0.001, lag27 p = 0.037)
+
+### Assault/Battery Misdimeanor
+
+```{python}
+crime = 'Assault/Battery Misdemeanor'
+
+df = pd.DataFrame()
+df['y'] = weekly_tlr[crime]
+df['lag52'] = weekly_tlr[crime].shift(52)
+df['lag51'] = weekly_tlr[crime].shift(51)
+df['lag53'] = weekly_tlr[crime].shift(53)
+df = df.dropna()
+
+X = sm.add_constant(df[['lag52', 'lag51', 'lag53']])
+y = df['y']
+
+model = sm.NegativeBinomial(y, X).fit()
+print(model.summary())
+```
+
+Also doing semi-annual:
+
+```{python}
+crime = 'Assault/Battery Misdemeanor'
+
+df = pd.DataFrame()
+df['y'] = weekly_tlr[crime]
+df['lag26'] = weekly_tlr[crime].shift(26)
+df['lag25'] = weekly_tlr[crime].shift(25)
+df['lag27'] = weekly_tlr[crime].shift(27)
+df = df.dropna()
+
+X = sm.add_constant(df[['lag26', 'lag25', 'lag27']])
+y = df['y']
+
+model = sm.NegativeBinomial(y, X).fit()
+print(model.summary())
+```
+
+Results: in this case, for annual lags, lag51 and lag53 are significant, but lag52 is not (lag52 p = 0.081, lag51 p = 0.015, lag53 p = 0.000). 
+
+For semi-annual lags, all lags are significant (lag26 p = 0.036, lag25 p = 0.001, lag27 p = 0.000). 
+
+Assault/Battery Misdemeanor is the only crime type in this 
+analysis to show evidence of both annual and semi-annual periodicity, 
+suggesting a seasonal structure that works at different time scales at the same time.
+
+
+# Plotting Counts
+
+By months:
+
+```{python}
+# Average count by month across all years
+monthly_avg = (
+    bpd_filtered
+    .groupby(["Incident_Type", "Month"])
+    .size()
+    .reset_index(name="Count")
+    .groupby(["Incident_Type", "Month"])["Count"]
+    .mean()
+    .reset_index()
+)
+
+# Plot
+fig, axes = plt.subplots(4, 2, figsize=(16, 20))
+axes = axes.flatten()
+month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+
+for i, crime in enumerate(major_crimes):
+    data = monthly_avg[monthly_avg["Incident_Type"] == crime]
+    axes[i].bar(data["Month"], data["Count"], color="steelblue", alpha=0.7)
+    axes[i].set_xticks(range(1, 13))
+    axes[i].set_xticklabels(month_names, rotation=45)
+    axes[i].set_title(crime, fontsize=11, fontweight="bold")
+    axes[i].set_ylabel("Avg Monthly Count")
+
+plt.suptitle("Average Monthly Crime Count by Type", fontsize=14, fontweight="bold")
+plt.tight_layout()
+plt.show()
+```
+
+By season:
+
+```{python}
+season_order = ["Winter", "Spring", "Summer", "Fall"]
+colors = {"Winter": "steelblue", "Spring": "mediumseagreen", "Summer": "tomato", "Fall": "darkorange"}
+
+fig, axes = plt.subplots(4, 2, figsize=(16, 20))
+axes = axes.flatten()
+
+for i, crime in enumerate(major_crimes):
+    seasonal = (
+        bpd_filtered[bpd_filtered["Incident_Type"] == crime]
+        .groupby("Season")
+        .size()
+        .reindex(season_order)  # ensures consistent order
+        .reset_index(name="Count")
+    )
+    
+    bar_colors = [colors[s] for s in season_order]
+    axes[i].bar(season_order, seasonal["Count"], color=bar_colors, alpha=0.8)
+    axes[i].set_title(crime, fontsize=12, fontweight="bold")
+    axes[i].set_xlabel("Season")
+    axes[i].set_ylabel("Total Count")
+
+plt.suptitle("Total Crime Count by Season", fontsize=16, fontweight="bold")
+plt.tight_layout()
+plt.show()
+```
